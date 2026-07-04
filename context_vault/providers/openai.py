@@ -12,7 +12,7 @@ from context_vault.models import ChatMessage, LLMResponse
 class OpenAIProvider(LLMProvider):
     """OpenAI chat-completions adapter.
 
-    The `openai` dependency is optional. Install with `context-vault[openai]`.
+    The `openai` dependency is optional. Install with `llm-context-vault[openai]`.
     """
 
     def __init__(self, model: str, api_key: str | None = None, **client_kwargs: Any) -> None:
@@ -30,7 +30,7 @@ class OpenAIProvider(LLMProvider):
                     "OpenAIProvider requires the optional `openai` package. "
                     "Install it with `python3 -m pip install openai`, "
                     "`python3 -m pip install -r requirements.txt`, or "
-                    "`python3 -m pip install context-vault[openai]` after publishing."
+                    "`python3 -m pip install llm-context-vault[openai]`."
                 ) from exc
             kwargs = dict(self.client_kwargs)
             if self.api_key is not None:

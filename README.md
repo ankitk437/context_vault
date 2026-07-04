@@ -9,7 +9,7 @@ It is intentionally not another LangChain. The core package is small, async-firs
 ## Install
 
 ```bash
-pip install context-vault
+pip install llm-context-vault
 ```
 
 For local development:
