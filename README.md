@@ -66,6 +66,7 @@ ContextVault
   |-- Memory Compressor
   |-- Importance Scorer
   |-- Vector Retriever
+  |-- Guardrails
   |-- LLM Provider
   |-- Storage Provider
   |-- Event Hooks
@@ -87,6 +88,7 @@ config = VaultConfig(
     importance_strategy="rule_based",
     compression_threshold=0.85,
     auto_update_long_term=True,
+    long_term_importance_threshold=None,
     vector_search=False,
     vector_top_k="adaptive",
     prompt_order=[
@@ -99,6 +101,11 @@ config = VaultConfig(
     ],
 )
 ```
+
+Set `long_term_importance_threshold` when you want message importance scores to
+control promotion into long-term memory. For example, `0.8` means only messages
+scored `0.8` or higher are sent to the long-term memory extractor. Leave it as
+`None` to keep the default frequency-based behavior.
 
 ## Custom LLM Provider
 
@@ -183,6 +190,45 @@ class MyExtractor(MemoryExtractor):
 
 Use this when you want LLM-based extraction, stricter privacy rules, domain-specific memory fields, or custom merge logic.
 
+## Seed Known User Memory
+
+If your application already knows stable user metadata, you can write it directly
+to long-term memory before the first chat:
+
+```python
+from context_vault import ContextVault, VaultConfig
+from context_vault.providers import OpenAIProvider
+
+vault = ContextVault(
+    llm_provider=OpenAIProvider(model="gpt-4o-mini"),
+    config=VaultConfig(
+        long_term_include_fields=["name", "grade_level", "preferences"],
+        long_term_exclude_fields=["private_note"],
+    ),
+)
+
+await vault.remember_user(
+    user_id="student-1",
+    facts={
+        "name": "Ankit",
+        "grade_level": "8",
+        "preferences": "short science examples",
+        "private_note": "not stored",
+    },
+    metadata={"source": "user_profile"},
+    respect_include_fields=True,
+)
+
+response = await vault.chat(
+    session_id="classroom-1",
+    user_id="student-1",
+    message="Explain photosynthesis.",
+)
+```
+
+Those facts are loaded through the same long-term memory path as LLM-extracted
+memory. Excluded fields are never stored by `remember_user`.
+
 ## Custom Importance Scorer
 
 ```python
@@ -196,6 +242,69 @@ class MyScorer(ImportanceScorer):
 ```
 
 Importance scores guide compression and memory decisions.
+
+## Guardrails
+
+Guardrails can block or rewrite user input, inject safety/policy instructions
+into the prompt, and rewrite unsafe model output before it is stored or returned.
+
+```python
+from context_vault import ContextVault
+from context_vault.guardrails import StudentTeacherGuardrail
+from context_vault.providers import OpenAIProvider
+
+vault = ContextVault(
+    llm_provider=OpenAIProvider(model="gpt-4o-mini"),
+    guardrails=[
+        StudentTeacherGuardrail(
+            student_age=13,
+            subject="science",
+            blocked_input_terms=["adult-only"],
+            blocked_output_terms=["unsafe phrase"],
+            extra_instructions="Use hints before giving final answers.",
+        )
+    ],
+)
+```
+
+You can also implement your own guardrail:
+
+```python
+from typing import Any
+
+from context_vault.interfaces import Guardrail
+from context_vault.models import ChatMessage, GuardrailResult, LLMResponse
+
+
+class MyGuardrail(Guardrail):
+    async def check_input(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        message: ChatMessage,
+        metadata: dict[str, Any],
+    ) -> GuardrailResult:
+        if "blocked" in message.content.lower():
+            return GuardrailResult.block("Please ask a safe learning question.")
+        return GuardrailResult.allow()
+
+    async def check_output(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        response: LLMResponse,
+        metadata: dict[str, Any],
+    ) -> GuardrailResult:
+        return GuardrailResult.allow()
+```
+
+Run the local student-teacher demo:
+
+```bash
+python examples/student_teacher_guardrails.py
+```
 
 ## Token Budgeting
 
@@ -248,6 +357,24 @@ unset OPENAI_API_KEY
 The script sends several sequential messages and prints long-term memory after
 each turn. It uses in-memory storage, so the memory exists only for that run.
 
+## Live OpenAI Full Workflow Test
+
+To test chat, short-term memory, long-term memory, vector retrieval,
+summarization, guardrails, per-action models, and lifecycle events together:
+
+```bash
+export OPENAI_API_KEY="your-key"
+export OPENAI_CHAT_MODEL="gpt-4o-mini"
+export OPENAI_MEMORY_MODEL="gpt-4o-mini"
+export OPENAI_COMPRESSION_MODEL="gpt-4o-mini"
+export OPENAI_IMPORTANCE_MODEL="gpt-4o-mini"
+python examples/openai_full_workflow_test.py
+unset OPENAI_API_KEY
+```
+
+All model environment variables are optional. If omitted, the script falls back
+to `OPENAI_MODEL` and then `gpt-4o-mini`.
+
 ## Memory Persistence Check
 
 The default `InMemoryStorage` persists only while the storage object exists. Run:
@@ -259,6 +386,18 @@ python examples/memory_persistence_check.py
 The example shows that memory is available in the same storage object, even across
 multiple `ContextVault` instances, but disappears when you create fresh in-memory
 storage. Use a database-backed `StorageProvider` for durable persistence.
+
+## Full Local Workflow Check
+
+Run a deterministic example that exercises short-term memory, long-term memory,
+vector retrieval, event hooks, per-action LLM providers, prompt construction,
+and compression:
+
+```bash
+python examples/full_workflow_check.py
+```
+
+This example does not call external APIs.
 
 ## Different Models Per Action
 

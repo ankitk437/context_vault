@@ -8,6 +8,7 @@ from typing import Any
 from context_vault.config import VaultConfig
 from context_vault.events import EventManager
 from context_vault.interfaces import (
+    Guardrail,
     ImportanceScorer,
     LLMProvider,
     MemoryCompressor,
@@ -49,6 +50,7 @@ class ChatPipeline:
         memory_extractor: MemoryExtractor,
         memory_compressor: MemoryCompressor,
         importance_scorer: ImportanceScorer,
+        guardrails: list[Guardrail],
         events: EventManager,
     ) -> None:
         self.llm_provider = llm_provider
@@ -63,6 +65,7 @@ class ChatPipeline:
         self.memory_extractor = memory_extractor
         self.memory_compressor = memory_compressor
         self.importance_scorer = importance_scorer
+        self.guardrails = guardrails
         self.events = events
 
     async def chat(
@@ -76,7 +79,26 @@ class ChatPipeline:
     ) -> LLMResponse:
         """Run one ContextVault chat interaction."""
 
-        user_message = ChatMessage(role="user", content=message, metadata=metadata or {})
+        guardrail_metadata = metadata or {}
+        user_message = ChatMessage(role="user", content=message, metadata=guardrail_metadata)
+        blocked_response = await self._apply_input_guardrails(
+            session_id=session_id,
+            user_id=user_id,
+            user_message=user_message,
+            metadata=guardrail_metadata,
+        )
+        if blocked_response is not None:
+            await self.session_manager.append_message(session_id, user_message)
+            await self.session_manager.append_message(
+                session_id,
+                ChatMessage(
+                    role="assistant",
+                    content=blocked_response.content,
+                    metadata={"model": blocked_response.model, **blocked_response.metadata},
+                ),
+            )
+            return blocked_response
+
         user_message.importance = await self.importance_scorer.score(user_message)
 
         await self.events.emit(
@@ -100,6 +122,12 @@ class ChatPipeline:
             token_budget=token_budget,
         )
         prompt_messages = await self.prompt_builder.build(context_bundle)
+        prompt_messages = await self._apply_prompt_guardrails(
+            session_id=session_id,
+            user_id=user_id,
+            prompt_messages=prompt_messages,
+            metadata=guardrail_metadata,
+        )
 
         await self.events.emit(
             "after_context_build",
@@ -120,6 +148,12 @@ class ChatPipeline:
             "after_llm_call",
             {"session_id": session_id, "user_id": user_id, "response": response},
         )
+        response = await self._apply_output_guardrails(
+            session_id=session_id,
+            user_id=user_id,
+            response=response,
+            metadata=guardrail_metadata,
+        )
 
         assistant_message = ChatMessage(
             role="assistant",
@@ -138,6 +172,165 @@ class ChatPipeline:
         )
 
         return response
+
+    async def _apply_input_guardrails(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        user_message: ChatMessage,
+        metadata: dict[str, Any],
+    ) -> LLMResponse | None:
+        for guardrail in self.guardrails:
+            await self.events.emit(
+                "before_input_guardrail",
+                {
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "guardrail": guardrail,
+                    "message": user_message,
+                },
+            )
+            result = await guardrail.check_input(
+                session_id=session_id,
+                user_id=user_id,
+                message=user_message,
+                metadata=metadata,
+            )
+            await self.events.emit(
+                "after_input_guardrail",
+                {
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "guardrail": guardrail,
+                    "message": user_message,
+                    "result": result,
+                },
+            )
+            if result.action == "rewrite" and result.content is not None:
+                user_message.content = result.content
+                user_message.metadata.setdefault("guardrails", []).append(
+                    self._guardrail_metadata(guardrail, result)
+                )
+            elif result.action == "block":
+                return self._guardrail_response(guardrail, result, blocked=True)
+        return None
+
+    async def _apply_prompt_guardrails(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        prompt_messages: list[ChatMessage],
+        metadata: dict[str, Any],
+    ) -> list[ChatMessage]:
+        messages = prompt_messages
+        for guardrail in self.guardrails:
+            await self.events.emit(
+                "before_prompt_guardrail",
+                {
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "guardrail": guardrail,
+                    "messages": messages,
+                },
+            )
+            messages = await guardrail.transform_prompt(
+                session_id=session_id,
+                user_id=user_id,
+                prompt_messages=messages,
+                metadata=metadata,
+            )
+            await self.events.emit(
+                "after_prompt_guardrail",
+                {
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "guardrail": guardrail,
+                    "messages": messages,
+                },
+            )
+        return messages
+
+    async def _apply_output_guardrails(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        response: LLMResponse,
+        metadata: dict[str, Any],
+    ) -> LLMResponse:
+        current = response
+        for guardrail in self.guardrails:
+            await self.events.emit(
+                "before_output_guardrail",
+                {
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "guardrail": guardrail,
+                    "response": current,
+                },
+            )
+            result = await guardrail.check_output(
+                session_id=session_id,
+                user_id=user_id,
+                response=current,
+                metadata=metadata,
+            )
+            await self.events.emit(
+                "after_output_guardrail",
+                {
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "guardrail": guardrail,
+                    "response": current,
+                    "result": result,
+                },
+            )
+            if result.action == "rewrite" and result.content is not None:
+                current = self._rewrite_response(current, guardrail, result)
+            elif result.action == "block":
+                current = self._guardrail_response(guardrail, result, blocked=True)
+                break
+        return current
+
+    def _rewrite_response(
+        self,
+        response: LLMResponse,
+        guardrail: Guardrail,
+        result: Any,
+    ) -> LLMResponse:
+        metadata = {
+            **response.metadata,
+            "guardrail_rewritten": True,
+            "guardrail": self._guardrail_metadata(guardrail, result),
+        }
+        return response.model_copy(update={"content": result.content, "metadata": metadata})
+
+    def _guardrail_response(
+        self,
+        guardrail: Guardrail,
+        result: Any,
+        *,
+        blocked: bool,
+    ) -> LLMResponse:
+        content = result.content or self.config.guardrail_block_response
+        return LLMResponse(
+            content=content,
+            model="guardrail",
+            metadata={
+                "guardrail_blocked": blocked,
+                "guardrail": self._guardrail_metadata(guardrail, result),
+            },
+        )
+
+    def _guardrail_metadata(self, guardrail: Guardrail, result: Any) -> dict[str, Any]:
+        return {
+            "name": guardrail.__class__.__name__,
+            "action": result.action,
+            "reason": result.reason,
+            **result.metadata,
+        }
 
     async def _retrieve_documents(
         self, user_message: ChatMessage, token_budget: TokenBudget
@@ -212,6 +405,9 @@ class ChatPipeline:
         conversation = await self.session_manager.get_recent_messages(session_id, limit=20)
         if not conversation:
             conversation = new_messages
+        conversation = self._filter_messages_for_long_term_memory(conversation)
+        if not conversation:
+            return
         await self.events.emit(
             "before_memory_update",
             {"session_id": session_id, "user_id": user_id, "memory": existing_memory},
@@ -222,4 +418,20 @@ class ChatPipeline:
             "after_memory_update",
             {"session_id": session_id, "user_id": user_id, "memory": updated},
         )
-        logger.debug("Updated long-term memory", extra={"session_id": session_id, "user_id": user_id})
+        logger.debug(
+            "Updated long-term memory",
+            extra={"session_id": session_id, "user_id": user_id},
+        )
+
+    def _filter_messages_for_long_term_memory(
+        self,
+        messages: list[ChatMessage],
+    ) -> list[ChatMessage]:
+        threshold = self.config.long_term_importance_threshold
+        if threshold is None:
+            return messages
+        return [
+            message
+            for message in messages
+            if message.importance is not None and message.importance >= threshold
+        ]

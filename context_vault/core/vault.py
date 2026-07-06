@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 from context_vault.compression import DefaultMemoryCompressor, LLMMemoryCompressor
@@ -11,6 +12,7 @@ from context_vault.events import EventManager
 from context_vault.importance import LLMImportanceScorer, RuleBasedImportanceScorer
 from context_vault.interfaces import (
     EmbeddingProvider,
+    Guardrail,
     ImportanceScorer,
     LLMProvider,
     MemoryCompressor,
@@ -22,7 +24,7 @@ from context_vault.interfaces import (
     VectorStore,
 )
 from context_vault.memory import LLMMemoryExtractor, RuleBasedMemoryExtractor
-from context_vault.models import LLMResponse
+from context_vault.models import LLMResponse, LongTermMemory
 from context_vault.pipeline import ChatPipeline
 from context_vault.planner import ContextPlanner, TokenBudgetManager
 from context_vault.prompt import DefaultPromptBuilder
@@ -53,6 +55,7 @@ class ContextVault:
         memory_extractor: MemoryExtractor | None = None,
         memory_compressor: MemoryCompressor | None = None,
         importance_scorer: ImportanceScorer | None = None,
+        guardrails: list[Guardrail] | None = None,
         events: EventManager | None = None,
     ) -> None:
         self.config = config or VaultConfig()
@@ -92,6 +95,7 @@ class ContextVault:
                 importance_scorer=self.importance_scorer,
             )
         )
+        self.guardrails = guardrails or []
         self.events = events or EventManager()
         self.pipeline = ChatPipeline(
             llm_provider=self.llm_provider,
@@ -106,6 +110,7 @@ class ContextVault:
             memory_extractor=self.memory_extractor,
             memory_compressor=self.memory_compressor,
             importance_scorer=self.importance_scorer,
+            guardrails=self.guardrails,
             events=self.events,
         )
 
@@ -127,6 +132,58 @@ class ContextVault:
             metadata=metadata,
             **llm_kwargs,
         )
+
+    async def remember_user(
+        self,
+        *,
+        user_id: str,
+        facts: dict[str, Any],
+        metadata: dict[str, Any] | None = None,
+        merge: bool = True,
+        respect_include_fields: bool = False,
+    ) -> LongTermMemory:
+        """Directly seed or update long-term memory with known user facts.
+
+        Use this when your app already knows stable user metadata, such as name,
+        role, grade level, locale, preferences, or account settings.
+        """
+
+        existing_memory = await self.storage.long_term.get_memory(user_id)
+        filtered_facts = self._filter_user_facts(
+            facts,
+            respect_include_fields=respect_include_fields,
+        )
+        next_facts = {**existing_memory.facts, **filtered_facts} if merge else filtered_facts
+        next_metadata = {**existing_memory.metadata, **(metadata or {})}
+        updated = existing_memory.model_copy(
+            update={
+                "facts": next_facts,
+                "metadata": next_metadata,
+                "version": existing_memory.version + 1,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        await self.storage.long_term.update_memory(user_id, updated)
+        return updated
+
+    async def get_user_memory(self, user_id: str) -> LongTermMemory:
+        """Return current long-term memory for a user."""
+
+        return await self.storage.long_term.get_memory(user_id)
+
+    def _filter_user_facts(
+        self,
+        facts: dict[str, Any],
+        *,
+        respect_include_fields: bool,
+    ) -> dict[str, Any]:
+        include = set(self.config.long_term_include_fields) if respect_include_fields else set()
+        exclude = set(self.config.long_term_exclude_fields)
+        return {
+            key: value
+            for key, value in facts.items()
+            if (not include or key in include) and key not in exclude
+        }
 
     async def close(self) -> None:
         """Close resources held by configured providers."""

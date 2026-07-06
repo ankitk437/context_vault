@@ -6,7 +6,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-
 RecentMessageLimit = int | Literal["adaptive"]
 VectorTopK = int | Literal["adaptive"]
 
@@ -22,9 +21,11 @@ class VaultConfig(BaseModel):
     importance_strategy: Literal["rule_based", "llm", "embedding"] = "rule_based"
     compression_threshold: float = Field(default=0.85, gt=0, le=1)
     auto_update_long_term: bool = True
+    long_term_importance_threshold: float | None = Field(default=None, ge=0, le=1)
     vector_search: bool = False
     vector_top_k: VectorTopK = "adaptive"
     system_prompt: str = "You are a helpful assistant."
+    guardrail_block_response: str = "I cannot help with that request."
     extraction_prompt: str | None = None
     prompt_order: list[str] = Field(
         default_factory=lambda: [
@@ -75,7 +76,7 @@ class VaultConfig(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def _validate_context_capacity(self) -> "VaultConfig":
+    def _validate_context_capacity(self) -> VaultConfig:
         if self.reserved_output_tokens >= self.max_context_tokens:
             raise ValueError("reserved_output_tokens must be less than max_context_tokens")
         overlap = set(self.long_term_include_fields) & set(self.long_term_exclude_fields)

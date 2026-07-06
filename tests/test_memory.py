@@ -34,6 +34,8 @@ class InMemoryStorageTests(unittest.IsolatedAsyncioTestCase):
 
         loaded = await store.get_summary("s1")
         self.assertIsNotNone(loaded)
+        if loaded is None:
+            self.fail("summary should have been saved")
         self.assertEqual(loaded.content, "older context")
 
     async def test_long_term_memory_roundtrip(self) -> None:
