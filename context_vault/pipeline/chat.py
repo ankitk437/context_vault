@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
 from typing import Any
 
 from context_vault.config import VaultConfig
@@ -22,6 +23,7 @@ from context_vault.interfaces import (
 from context_vault.models import (
     ChatMessage,
     LLMResponse,
+    LLMStreamEvent,
     LongTermMemory,
     MemorySummary,
     SearchResult,
@@ -172,6 +174,167 @@ class ChatPipeline:
         )
 
         return response
+
+    async def chat_stream(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        message: str,
+        metadata: dict[str, Any] | None = None,
+        **llm_kwargs: Any,
+    ) -> AsyncIterator[LLMStreamEvent]:
+        """Run one ContextVault chat interaction and stream LLM text deltas."""
+
+        guardrail_metadata = metadata or {}
+        user_message = ChatMessage(role="user", content=message, metadata=guardrail_metadata)
+        blocked_response = await self._apply_input_guardrails(
+            session_id=session_id,
+            user_id=user_id,
+            user_message=user_message,
+            metadata=guardrail_metadata,
+        )
+        if blocked_response is not None:
+            await self._store_completed_turn(
+                session_id=session_id,
+                user_message=user_message,
+                response=blocked_response,
+                existing_memory=None,
+                user_id=user_id,
+            )
+            if blocked_response.content:
+                yield LLMStreamEvent(
+                    type="response.output_text.delta",
+                    delta=blocked_response.content,
+                    model=blocked_response.model,
+                    metadata=blocked_response.metadata,
+                )
+            yield LLMStreamEvent(
+                type="response.completed",
+                response=blocked_response,
+                model=blocked_response.model,
+            )
+            return
+
+        user_message.importance = await self.importance_scorer.score(user_message)
+
+        await self.events.emit(
+            "before_context_build",
+            {"session_id": session_id, "user_id": user_id, "message": user_message},
+        )
+
+        token_budget = self.token_budget_manager.allocate(self.config.system_prompt, user_message)
+        recent_messages = await self.session_manager.get_recent_messages(session_id)
+        long_term_memory = await self.storage.long_term.get_memory(user_id)
+        retrieved_documents = await self._retrieve_documents(user_message, token_budget)
+        summary = await self._maybe_compress(session_id, recent_messages, token_budget)
+
+        context_bundle = await self.context_planner.plan(
+            system_prompt=self.config.system_prompt,
+            current_user_message=user_message,
+            recent_messages=recent_messages,
+            long_term_memory=long_term_memory,
+            conversation_summary=summary,
+            retrieved_documents=retrieved_documents,
+            token_budget=token_budget,
+        )
+        prompt_messages = await self.prompt_builder.build(context_bundle)
+        prompt_messages = await self._apply_prompt_guardrails(
+            session_id=session_id,
+            user_id=user_id,
+            prompt_messages=prompt_messages,
+            metadata=guardrail_metadata,
+        )
+
+        await self.events.emit(
+            "after_context_build",
+            {
+                "session_id": session_id,
+                "user_id": user_id,
+                "context": context_bundle,
+                "prompt_messages": prompt_messages,
+            },
+        )
+
+        await self.events.emit(
+            "before_llm_call",
+            {"session_id": session_id, "user_id": user_id, "messages": prompt_messages},
+        )
+        response_parts: list[str] = []
+        streamed_response: LLMResponse | None = None
+        async for event in self.llm_provider.stream_generate(prompt_messages, **llm_kwargs):
+            if event.type == "response.output_text.delta":
+                response_parts.append(event.delta)
+                yield event
+            elif event.type == "response.completed":
+                streamed_response = event.response
+            else:
+                yield event
+
+        response = streamed_response or LLMResponse(
+            content="".join(response_parts),
+            model=getattr(self.llm_provider, "model", None),
+        )
+        if not response.content and response_parts:
+            response = response.model_copy(update={"content": "".join(response_parts)})
+
+        await self.events.emit(
+            "after_llm_call",
+            {"session_id": session_id, "user_id": user_id, "response": response},
+        )
+        guarded_response = await self._apply_output_guardrails(
+            session_id=session_id,
+            user_id=user_id,
+            response=response,
+            metadata=guardrail_metadata,
+        )
+        if guarded_response.content != response.content:
+            yield LLMStreamEvent(
+                type="response.output_text.rewrite",
+                delta=guarded_response.content,
+                response=guarded_response,
+                model=guarded_response.model,
+                metadata=guarded_response.metadata,
+            )
+
+        await self._store_completed_turn(
+            session_id=session_id,
+            user_id=user_id,
+            user_message=user_message,
+            response=guarded_response,
+            existing_memory=long_term_memory,
+        )
+        yield LLMStreamEvent(
+            type="response.completed",
+            response=guarded_response,
+            model=guarded_response.model,
+        )
+
+    async def _store_completed_turn(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        user_message: ChatMessage,
+        response: LLMResponse,
+        existing_memory: LongTermMemory | None,
+    ) -> None:
+        assistant_message = ChatMessage(
+            role="assistant",
+            content=response.content,
+            metadata={"model": response.model, **response.metadata},
+        )
+        assistant_message.importance = await self.importance_scorer.score(assistant_message)
+        await self.session_manager.append_message(session_id, user_message)
+        await self.session_manager.append_message(session_id, assistant_message)
+        if existing_memory is None:
+            return
+        await self._maybe_update_long_term_memory(
+            session_id=session_id,
+            user_id=user_id,
+            existing_memory=existing_memory,
+            new_messages=[user_message, assistant_message],
+        )
 
     async def _apply_input_guardrails(
         self,

@@ -1,7 +1,7 @@
 """ContextVault public API."""
 
-from context_vault.config import VaultConfig
 from context_vault.compression import LLMMemoryCompressor
+from context_vault.config import VaultConfig
 from context_vault.core import ContextVault
 from context_vault.importance import LLMImportanceScorer
 from context_vault.memory import LLMMemoryExtractor
@@ -11,6 +11,7 @@ from context_vault.models import (
     Document,
     GuardrailResult,
     LLMResponse,
+    LLMStreamEvent,
     LongTermMemory,
     MemorySummary,
     SearchResult,
@@ -27,6 +28,7 @@ __all__ = [
     "LLMMemoryCompressor",
     "LLMMemoryExtractor",
     "LLMResponse",
+    "LLMStreamEvent",
     "LongTermMemory",
     "MemorySummary",
     "SearchResult",

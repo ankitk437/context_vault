@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from context_vault import ContextVault, VaultConfig
+from context_vault.guardrails import KeywordBlockGuardrail
 from context_vault.interfaces import ImportanceScorer
 from context_vault.models import ChatMessage, Document
 from context_vault.providers import EchoLLMProvider, MockLLMProvider
@@ -32,6 +33,56 @@ class ChatPipelineTests(unittest.IsolatedAsyncioTestCase):
         messages = await storage.short_term.get_messages("s1")
         self.assertEqual(response.content, "Echo: hello")
         self.assertEqual([message.role for message in messages], ["user", "assistant"])
+
+    async def test_chat_stream_yields_delta_and_stores_messages(self) -> None:
+        storage = InMemoryStorage()
+        vault = ContextVault(llm_provider=EchoLLMProvider(), storage=storage)
+
+        events = [
+            event
+            async for event in vault.chat_stream(
+                session_id="s1",
+                user_id="u1",
+                message="hello",
+            )
+        ]
+
+        messages = await storage.short_term.get_messages("s1")
+        self.assertEqual(events[0].type, "response.output_text.delta")
+        self.assertEqual(events[0].delta, "Echo: hello")
+        self.assertEqual(events[-1].type, "response.completed")
+        self.assertIsNotNone(events[-1].response)
+        if events[-1].response is None:
+            self.fail("stream should include final response")
+        self.assertEqual(events[-1].response.content, "Echo: hello")
+        self.assertEqual([message.role for message in messages], ["user", "assistant"])
+
+    async def test_chat_stream_yields_guardrail_block_response(self) -> None:
+        storage = InMemoryStorage()
+        vault = ContextVault(
+            llm_provider=EchoLLMProvider(),
+            storage=storage,
+            guardrails=[
+                KeywordBlockGuardrail(
+                    blocked_input_terms=["blocked"],
+                    response="Please ask a different question.",
+                )
+            ],
+        )
+
+        events = [
+            event
+            async for event in vault.chat_stream(
+                session_id="s1",
+                user_id="u1",
+                message="blocked request",
+            )
+        ]
+
+        messages = await storage.short_term.get_messages("s1")
+        self.assertEqual(events[0].delta, "Please ask a different question.")
+        self.assertEqual(events[-1].type, "response.completed")
+        self.assertEqual(len(messages), 2)
 
     async def test_memory_update_frequency_extracts_long_term_memory(self) -> None:
         storage = InMemoryStorage()

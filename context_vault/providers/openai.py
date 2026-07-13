@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Any
 
 from context_vault.exceptions import ProviderError
 from context_vault.interfaces import LLMProvider
-from context_vault.models import ChatMessage, LLMResponse
+from context_vault.models import ChatMessage, LLMResponse, LLMStreamEvent
 
 
 class OpenAIProvider(LLMProvider):
@@ -60,3 +61,47 @@ class OpenAIProvider(LLMProvider):
                 "total_tokens": response.usage.total_tokens,
             }
         return LLMResponse(content=content, model=self.model, raw=response, usage=usage)
+
+    async def stream_generate(
+        self,
+        messages: list[ChatMessage],
+        **kwargs: Any,
+    ) -> AsyncIterator[LLMStreamEvent]:
+        """Stream a response using OpenAI chat-completions streaming."""
+
+        client = self._client_instance()
+        kwargs.pop("stream", None)
+        stream = await client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": message.role, "content": message.content}
+                for message in messages
+                if message.role in {"system", "user", "assistant"}
+            ],
+            stream=True,
+            **kwargs,
+        )
+        parts: list[str] = []
+        finish_reason: str | None = None
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+            delta = choice.delta.content or ""
+            if not delta:
+                continue
+            parts.append(delta)
+            yield LLMStreamEvent(
+                type="response.output_text.delta",
+                delta=delta,
+                model=self.model,
+            )
+
+        response = LLMResponse(
+            content="".join(parts),
+            model=self.model,
+            metadata={"finish_reason": finish_reason} if finish_reason else {},
+        )
+        yield LLMStreamEvent(type="response.completed", response=response, model=self.model)

@@ -15,3 +15,13 @@ class LLMResponse(BaseModel):
     raw: Any = None
     usage: dict[str, int] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class LLMStreamEvent(BaseModel):
+    """Provider-agnostic streaming event returned from an LLM provider."""
+
+    type: str
+    delta: str = ""
+    response: LLMResponse | None = None
+    model: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)

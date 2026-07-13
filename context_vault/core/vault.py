@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
 
@@ -24,7 +25,7 @@ from context_vault.interfaces import (
     VectorStore,
 )
 from context_vault.memory import LLMMemoryExtractor, RuleBasedMemoryExtractor
-from context_vault.models import LLMResponse, LongTermMemory
+from context_vault.models import LLMResponse, LLMStreamEvent, LongTermMemory
 from context_vault.pipeline import ChatPipeline
 from context_vault.planner import ContextPlanner, TokenBudgetManager
 from context_vault.prompt import DefaultPromptBuilder
@@ -132,6 +133,26 @@ class ContextVault:
             metadata=metadata,
             **llm_kwargs,
         )
+
+    async def chat_stream(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        message: str,
+        metadata: dict[str, Any] | None = None,
+        **llm_kwargs: Any,
+    ) -> AsyncIterator[LLMStreamEvent]:
+        """Stream one context-aware LLM interaction."""
+
+        async for event in self.pipeline.chat_stream(
+            session_id=session_id,
+            user_id=user_id,
+            message=message,
+            metadata=metadata,
+            **llm_kwargs,
+        ):
+            yield event
 
     async def remember_user(
         self,

@@ -122,6 +122,62 @@ class MyLLMProvider(LLMProvider):
         return LLMResponse(content=text, model="my-model")
 ```
 
+Providers can optionally implement `stream_generate`. If they do not,
+ContextVault falls back to one full-response delta.
+
+```python
+from collections.abc import AsyncIterator
+from typing import Any
+
+from context_vault.interfaces import LLMProvider
+from context_vault.models import ChatMessage, LLMResponse, LLMStreamEvent
+
+
+class MyStreamingProvider(LLMProvider):
+    async def generate(self, messages: list[ChatMessage], **kwargs: Any) -> LLMResponse:
+        ...
+
+    async def stream_generate(
+        self,
+        messages: list[ChatMessage],
+        **kwargs: Any,
+    ) -> AsyncIterator[LLMStreamEvent]:
+        async for text_delta in call_my_streaming_model(messages, **kwargs):
+            yield LLMStreamEvent(type="response.output_text.delta", delta=text_delta)
+```
+
+## Streaming Chat
+
+Use `chat_stream` when you want to return Server-Sent Events from your backend.
+The final `response.completed` event is emitted after ContextVault stores the
+assistant message and runs memory updates.
+
+```python
+import json
+
+async for event in vault.chat_stream(
+    session_id="abc123",
+    user_id="user-1",
+    message="Explain quicksort.",
+):
+    if event.type == "response.output_text.delta":
+        yield f"event: {event.type}\ndata: {json.dumps({'delta': event.delta})}\n\n"
+    elif event.type == "response.completed":
+        yield f"event: {event.type}\ndata: {json.dumps({'done': True})}\n\n"
+```
+
+Run the live OpenAI SSE-style example:
+
+```bash
+export OPENAI_API_KEY="your-key"
+python examples/openai_streaming_sse_test.py
+unset OPENAI_API_KEY
+```
+
+Output guardrails run after the full streamed response is available. If an output
+guardrail rewrites the response, ContextVault emits
+`response.output_text.rewrite` before `response.completed`.
+
 ## Custom Storage
 
 ```python
